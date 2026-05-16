@@ -23,7 +23,7 @@ TEMP_TTL      = 300
 CACHE_TTL_SEC = 600
 
 # ── MongoDB ───────────────────────────────────────────────────────────────────
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://paradox:AcerDom9088@cluster0.0bg3lex.mongodb.net/?appName=Cluster0")
 MONGO_DB  = os.environ.get("MONGO_DB", "yt_downloader")
 
 _db = None
