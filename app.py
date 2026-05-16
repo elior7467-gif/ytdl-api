@@ -1,13 +1,18 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import yt_dlp
 import os
 import re
 import time
+import tempfile
+import threading
+import unicodedata
 
 app = Flask(__name__)
-REQUEST_DELAY = 1.0
 
-COOKIES_FILE = 'cookies.txt'
+REQUEST_DELAY = 1.0
+COOKIES_FILE  = 'cookies.txt'
+TEMP_DIR      = tempfile.gettempdir()
+TEMP_TTL      = 300   # delete temp file after 5 minutes
 
 VIDEO_ID_PATTERNS = [
     r'(?:v=|\/)([0-9A-Za-z_-]{11})',
@@ -23,24 +28,33 @@ def extract_video_id(url: str):
             return m.group(1)
     return None
 
-def safe_int(v):
-    try:
-        if v is None:
-            return None
-        if isinstance(v, int):
-            return v
-        return int(v)
-    except Exception:
-        return None
+def safe_filename(title: str) -> str:
+    """Convert title to a safe ASCII filename."""
+    # Normalize unicode → ASCII as much as possible
+    normalized = unicodedata.normalize('NFKD', title or 'audio')
+    ascii_str   = normalized.encode('ascii', 'ignore').decode('ascii')
+    # Remove anything that's not alphanumeric, space, dash, dot
+    safe        = re.sub(r'[^\w\s\-]', '', ascii_str).strip()
+    safe        = re.sub(r'\s+', '_', safe)
+    return safe[:100] or 'audio'   # max 100 chars
+
+def schedule_delete(path: str, delay: int = TEMP_TTL):
+    """Delete temp file after delay seconds."""
+    def _delete():
+        time.sleep(delay)
+        try:
+            os.remove(path)
+            app.logger.info(f"Deleted temp file: {path}")
+        except OSError:
+            pass
+    threading.Thread(target=_delete, daemon=True).start()
 
 def base_ydl_opts():
     opts = {
-        'quiet': True,
+        'quiet':       True,
         'no_warnings': True,
-        'skip_download': True,
-        'extract_flat': False,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
         },
     }
@@ -49,256 +63,170 @@ def base_ydl_opts():
     return opts
 
 
-# ── Pick best audio from formats list ─────────────────────────────────────────
+# ── Download MP3 by name ───────────────────────────────────────────────────────
 
-def pick_best_audio(formats: list):
-    audios = [f for f in formats if f['has_audio'] and not f['has_video']]
-    if not audios:
-        # fallback: muxed
-        audios = [f for f in formats if f['has_audio']]
-    if not audios:
-        return None
-    return max(audios, key=lambda f: (f.get('abr') or 0))
-
-def pick_best_video(formats: list):
-    videos = [f for f in formats if f['has_video'] and not f['has_audio']]
-    if not videos:
-        videos = [f for f in formats if f['has_video']]
-    if not videos:
-        return None
-    return max(videos, key=lambda f: (f.get('height') or 0, f.get('fps') or 0))
-
-
-# ── Core: search by name AND return stream URL in one shot ────────────────────
-
-def search_and_get_stream(query: str, mode: str = 'audio'):
+def download_mp3_by_name(query: str):
     """
-    Searches YouTube by name and immediately fetches stream URLs for the top result.
-    mode: 'audio' | 'video' | 'both'
-    Returns a dict with all info + stream urls.
+    Searches YouTube for query, downloads top result as MP3.
+    Returns (file_path, title, error_message)
     """
+    # Use a unique temp filename to avoid collisions
+    import uuid
+    job_id   = uuid.uuid4().hex[:8]
+    out_tmpl = os.path.join(TEMP_DIR, f"{job_id}_%(title)s.%(ext)s")
+
     ydl_opts = base_ydl_opts()
-    # Do NOT use extract_flat — we need full format info in one call
-    ydl_opts['extract_flat'] = False
-    ydl_opts['noplaylist']   = True
-
-    search_url = f"ytsearch1:{query}"   # grab only top 1 result with full info
+    ydl_opts.update({
+        'format':           'bestaudio/best',
+        'outtmpl':          out_tmpl,
+        'noplaylist':       True,
+        'postprocessors':   [{
+            'key':            'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+        # Search YouTube and take top result
+        'default_search':   'ytsearch1',
+    })
 
     try:
         time.sleep(REQUEST_DELAY)
-        app.logger.info(f"Search+stream for: {query} [{mode}]")
+        app.logger.info(f"Downloading MP3 for: {query}")
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(search_url, download=False)
+            info = ydl.extract_info(query, download=True)
 
-        if not info or not info.get('entries'):
-            return None, "No results found"
+        # If search result, unwrap entries
+        if 'entries' in info:
+            info = info['entries'][0]
 
-        entry = info['entries'][0]
-        if not entry:
-            return None, "Empty result"
+        title    = info.get('title', query)
+        video_id = info.get('id', job_id)
 
-        title    = entry.get('title')
-        video_id = entry.get('id')
-        yt_url   = f"https://www.youtube.com/watch?v={video_id}"
-        duration = entry.get('duration')
-        channel  = entry.get('uploader') or entry.get('channel')
-        thumbnail= entry.get('thumbnail')
+        # Find the downloaded MP3 file
+        mp3_path = None
+        for fname in os.listdir(TEMP_DIR):
+            if fname.startswith(job_id) and fname.endswith('.mp3'):
+                mp3_path = os.path.join(TEMP_DIR, fname)
+                break
 
-        # Parse formats
-        formats = []
-        for f in entry.get('formats', []):
-            if not f.get('url'):
-                continue
-            ext  = f.get('ext') or 'unknown'
-            mime = f.get('mimeType') or f.get('format', '')
-            if '/' in mime:
-                ext = mime.split('/')[1].split(';')[0]
-            has_video = f.get('vcodec', 'none') != 'none'
-            has_audio = f.get('acodec', 'none') != 'none'
-            formats.append({
-                'url':      f.get('url'),
-                'ext':      ext,
-                'height':   safe_int(f.get('height')),
-                'fps':      safe_int(f.get('fps')),
-                'abr':      safe_int(f.get('tbr') or f.get('abr')),
-                'filesize': safe_int(f.get('filesize') or f.get('filesize_approx')),
-                'vcodec':   f.get('vcodec', 'unknown'),
-                'acodec':   f.get('acodec', 'none'),
-                'has_video': has_video,
-                'has_audio': has_audio,
-            })
+        if not mp3_path or not os.path.exists(mp3_path):
+            return None, title, "MP3 file not found after download"
 
-        result = {
-            'video_id':  video_id,
-            'title':     title,
-            'url':       yt_url,
-            'duration':  duration,
-            'channel':   channel,
-            'thumbnail': thumbnail,
-        }
-
-        if mode in ('audio', 'both'):
-            best_audio = pick_best_audio(formats)
-            result['audio_stream'] = {
-                'stream_url': best_audio['url']      if best_audio else None,
-                'ext':        best_audio['ext']      if best_audio else None,
-                'abr':        best_audio['abr']      if best_audio else None,
-                'filesize':   best_audio['filesize'] if best_audio else None,
-            }
-
-        if mode in ('video', 'both'):
-            best_video = pick_best_video(formats)
-            result['video_stream'] = {
-                'stream_url': best_video['url']      if best_video else None,
-                'ext':        best_video['ext']      if best_video else None,
-                'height':     best_video['height']   if best_video else None,
-                'fps':        best_video['fps']      if best_video else None,
-                'filesize':   best_video['filesize'] if best_video else None,
-            }
-
-        return result, None
+        return mp3_path, title, None
 
     except Exception as e:
-        app.logger.exception(f"search_and_get_stream error: {e}")
         msg = str(e)
+        app.logger.exception(f"Download error: {e}")
         if any(k in msg for k in ("Sign in", "bot", "LOGIN_REQUIRED")):
-            return None, "LOGIN_REQUIRED — cookies may be invalid or expired"
-        return None, msg
+            return None, None, "LOGIN_REQUIRED — cookies may be invalid or expired"
+        return None, None, msg
 
 
-# ── Core: get stream by URL ───────────────────────────────────────────────────
+# ── Download MP3 by URL ────────────────────────────────────────────────────────
 
-def get_stream_by_url(youtube_url: str, mode: str = 'audio'):
+def download_mp3_by_url(youtube_url: str):
+    """
+    Downloads a specific YouTube URL as MP3.
+    Returns (file_path, title, error_message)
+    """
+    import uuid
+    job_id   = uuid.uuid4().hex[:8]
+    out_tmpl = os.path.join(TEMP_DIR, f"{job_id}_%(title)s.%(ext)s")
+
     ydl_opts = base_ydl_opts()
+    ydl_opts.update({
+        'format':         'bestaudio/best',
+        'outtmpl':        out_tmpl,
+        'noplaylist':     True,
+        'postprocessors': [{
+            'key':              'FFmpegExtractAudio',
+            'preferredcodec':   'mp3',
+            'preferredquality': '192',
+        }],
+    })
 
     try:
         time.sleep(REQUEST_DELAY)
+        app.logger.info(f"Downloading MP3 for URL: {youtube_url}")
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(youtube_url, download=False)
+            info = ydl.extract_info(youtube_url, download=True)
 
-        if not info:
-            return None, "No info returned"
+        title = info.get('title', 'audio')
 
-        title    = info.get('title')
-        video_id = info.get('id')
-        channel  = info.get('uploader') or info.get('channel')
-        thumbnail= info.get('thumbnail')
-        duration = info.get('duration')
+        mp3_path = None
+        for fname in os.listdir(TEMP_DIR):
+            if fname.startswith(job_id) and fname.endswith('.mp3'):
+                mp3_path = os.path.join(TEMP_DIR, fname)
+                break
 
-        formats = []
-        for f in info.get('formats', []):
-            if not f.get('url'):
-                continue
-            ext  = f.get('ext') or 'unknown'
-            mime = f.get('mimeType') or f.get('format', '')
-            if '/' in mime:
-                ext = mime.split('/')[1].split(';')[0]
-            has_video = f.get('vcodec', 'none') != 'none'
-            has_audio = f.get('acodec', 'none') != 'none'
-            formats.append({
-                'url':      f.get('url'),
-                'ext':      ext,
-                'height':   safe_int(f.get('height')),
-                'fps':      safe_int(f.get('fps')),
-                'abr':      safe_int(f.get('tbr') or f.get('abr')),
-                'filesize': safe_int(f.get('filesize') or f.get('filesize_approx')),
-                'vcodec':   f.get('vcodec', 'unknown'),
-                'acodec':   f.get('acodec', 'none'),
-                'has_video': has_video,
-                'has_audio': has_audio,
-            })
+        if not mp3_path or not os.path.exists(mp3_path):
+            return None, title, "MP3 file not found after download"
 
-        result = {
-            'video_id':  video_id,
-            'title':     title,
-            'url':       youtube_url,
-            'duration':  duration,
-            'channel':   channel,
-            'thumbnail': thumbnail,
-        }
-
-        if mode in ('audio', 'both'):
-            best_audio = pick_best_audio(formats)
-            result['audio_stream'] = {
-                'stream_url': best_audio['url']      if best_audio else None,
-                'ext':        best_audio['ext']      if best_audio else None,
-                'abr':        best_audio['abr']      if best_audio else None,
-                'filesize':   best_audio['filesize'] if best_audio else None,
-            }
-
-        if mode in ('video', 'both'):
-            best_video = pick_best_video(formats)
-            result['video_stream'] = {
-                'stream_url': best_video['url']      if best_video else None,
-                'ext':        best_video['ext']      if best_video else None,
-                'height':     best_video['height']   if best_video else None,
-                'fps':        best_video['fps']      if best_video else None,
-                'filesize':   best_video['filesize'] if best_video else None,
-            }
-
-        return result, None
+        return mp3_path, title, None
 
     except Exception as e:
         msg = str(e)
         if any(k in msg for k in ("Sign in", "bot", "LOGIN_REQUIRED")):
-            return None, "LOGIN_REQUIRED — cookies may be invalid or expired"
-        return None, msg
+            return None, None, "LOGIN_REQUIRED — cookies may be invalid or expired"
+        return None, None, msg
 
 
-# ── Route: GET /search — search by name, get stream URL directly ──────────────
-@app.route('/search', methods=['GET'])
-def search_endpoint():
+# ── Route: GET /download — search by name and download MP3 ───────────────────
+@app.route('/download', methods=['GET'])
+def download_by_name():
     """
-    Search YouTube by song/video name and get stream URL directly.
+    Search YouTube by song name and download as MP3 directly to browser.
 
-    GET /search?q=shape+of+you                  → audio stream (default)
-    GET /search?q=shape+of+you&mode=video       → video stream
-    GET /search?q=shape+of+you&mode=both        → audio + video streams
+    GET /download?q=shape+of+you
+    GET /download?q=eminem+lose+yourself
+    GET /download?q=never+gonna+give+you+up
 
-    Response includes stream_url ready to plug into FFmpeg or music bot.
+    The MP3 file downloads automatically in the browser.
+    Requires ffmpeg installed on the server.
     """
     query = (request.args.get('q') or request.args.get('name') or '').strip()
     if not query:
         return jsonify({
             'error':    'q param is required',
             'examples': [
-                '/search?q=shape+of+you',
-                '/search?q=blinding+lights&mode=audio',
-                '/search?q=never+gonna+give+you+up&mode=both',
+                '/download?q=shape+of+you',
+                '/download?q=blinding+lights',
+                '/download?q=never+gonna+give+you+up',
             ]
         }), 400
 
-    mode = (request.args.get('mode') or 'audio').strip().lower()
-    if mode not in ('audio', 'video', 'both'):
-        return jsonify({'error': "mode must be 'audio', 'video', or 'both'"}), 400
-
-    result, err = search_and_get_stream(query, mode=mode)
+    mp3_path, title, err = download_mp3_by_name(query)
 
     if err:
         return jsonify({'error': err, 'query': query}), 500
 
-    if not result:
-        return jsonify({'status': 'ok', 'query': query, 'result': None, 'note': 'No results found'}), 200
+    if not mp3_path:
+        return jsonify({'error': 'Download failed', 'query': query}), 500
 
-    return jsonify({
-        'status': 'ok',
-        'query':  query,
-        'mode':   mode,
-        'result': result,
-    }), 200
+    # Schedule deletion after 5 minutes
+    schedule_delete(mp3_path, TEMP_TTL)
+
+    filename = safe_filename(title) + '.mp3'
+
+    return send_file(
+        mp3_path,
+        mimetype='audio/mpeg',
+        as_attachment=True,
+        download_name=filename,
+    )
 
 
-# ── Route: GET /stream — get stream URL by YouTube URL ───────────────────────
-@app.route('/stream', methods=['GET'])
-def stream_endpoint():
+# ── Route: GET /download-url — download MP3 from a YouTube URL ───────────────
+@app.route('/download-url', methods=['GET'])
+def download_by_url():
     """
-    Get stream URL directly from a YouTube URL.
+    Download a specific YouTube video as MP3.
 
-    GET /stream?url=https://youtu.be/dQw4w9WgXcQ
-    GET /stream?url=https://youtu.be/dQw4w9WgXcQ&mode=video
-    GET /stream?url=https://youtu.be/dQw4w9WgXcQ&mode=both
+    GET /download-url?url=https://youtu.be/dQw4w9WgXcQ
 
-    Perfect for music bots — one call, fresh stream URL, ready to play.
+    The MP3 file downloads automatically in the browser.
     """
     youtube_url = (request.args.get('url') or request.args.get('u') or '').strip()
     if not youtube_url:
@@ -306,118 +234,133 @@ def stream_endpoint():
     if not any(d in youtube_url for d in ('youtube.com', 'youtu.be')):
         return jsonify({'error': 'Not a YouTube URL'}), 400
 
+    mp3_path, title, err = download_mp3_by_url(youtube_url)
+
+    if err:
+        return jsonify({'error': err, 'url': youtube_url}), 500
+
+    if not mp3_path:
+        return jsonify({'error': 'Download failed'}), 500
+
+    schedule_delete(mp3_path, TEMP_TTL)
+
+    filename = safe_filename(title) + '.mp3'
+
+    return send_file(
+        mp3_path,
+        mimetype='audio/mpeg',
+        as_attachment=True,
+        download_name=filename,
+    )
+
+
+# ── Route: GET /search — search only, return stream URL (no download) ─────────
+@app.route('/search', methods=['GET'])
+def search_endpoint():
+    """
+    Search YouTube by name, return stream URL (no file download).
+
+    GET /search?q=shape+of+you
+    GET /search?q=shape+of+you&mode=both
+    """
+    from flask import abort
+    query = (request.args.get('q') or request.args.get('name') or '').strip()
+    if not query:
+        return jsonify({'error': 'q param is required', 'example': '/search?q=shape+of+you'}), 400
+
     mode = (request.args.get('mode') or 'audio').strip().lower()
     if mode not in ('audio', 'video', 'both'):
         return jsonify({'error': "mode must be 'audio', 'video', or 'both'"}), 400
 
-    result, err = get_stream_by_url(youtube_url, mode=mode)
-    if err:
-        return jsonify({'error': err, 'url': youtube_url}), 500
-
-    return jsonify({
-        'status': 'ok',
-        'mode':   mode,
-        'result': result,
-    }), 200
-
-
-# ── Route: GET / — formats by URL (original endpoint kept) ───────────────────
-@app.route('/', methods=['GET', 'HEAD'])
-@app.route('/online', methods=['GET'])
-def formats_endpoint():
-    youtube_url = (request.args.get('url') or request.args.get('u') or '').strip()
-
-    if not youtube_url:
-        return jsonify({
-            "status":  "ok",
-            "service": "yt-stream-api (yt-dlp)",
-            "version": "3.0",
-            "endpoints": {
-                "GET /search?q=<name>":              "Search by name → get stream URL directly (default: audio)",
-                "GET /search?q=<name>&mode=video":   "Search by name → get video stream URL",
-                "GET /search?q=<name>&mode=both":    "Search by name → get audio + video stream URLs",
-                "GET /stream?url=<yt_url>":          "Get stream URL from YouTube URL (default: audio)",
-                "GET /stream?url=<yt_url>&mode=both":"Get audio + video stream URLs from YouTube URL",
-                "GET /?url=<yt_url>":                "Get ALL formats (raw)",
-            }
-        }), 200
-
-    if not any(domain in youtube_url for domain in ('youtube.com', 'youtu.be')):
-        return jsonify({'error': 'url does not look like a YouTube URL'}), 400
-
-    video_id = extract_video_id(youtube_url)
-    if not video_id:
-        return jsonify({'error': 'could not extract video id from url'}), 400
-
     ydl_opts = base_ydl_opts()
+    ydl_opts['skip_download'] = True
+    ydl_opts['extract_flat']  = False
+    ydl_opts['noplaylist']    = True
+
+    def safe_int(v):
+        try: return int(v) if v is not None else None
+        except: return None
+
     try:
         time.sleep(REQUEST_DELAY)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(youtube_url, download=False)
+            info = ydl.extract_info(f"ytsearch1:{query}", download=False)
 
-        if not info:
-            return jsonify({'error': 'No info returned'}), 500
+        if not info or not info.get('entries'):
+            return jsonify({'status': 'ok', 'query': query, 'result': None}), 200
 
-        title       = info.get('title')
-        vid_id      = info.get('id')
-        formats_raw = info.get('formats', [])
+        entry = info['entries'][0]
+        title    = entry.get('title')
+        video_id = entry.get('id')
 
         formats = []
-        for f in formats_raw:
-            if not f.get('url'):
-                continue
-            ext  = f.get('ext') or 'unknown'
-            mime = f.get('mimeType') or f.get('format', '')
-            if '/' in mime:
-                ext = mime.split('/')[1].split(';')[0]
+        for f in entry.get('formats', []):
+            if not f.get('url'): continue
             has_video = f.get('vcodec', 'none') != 'none'
             has_audio = f.get('acodec', 'none') != 'none'
             formats.append({
-                'itag':         f.get('format_id'),
-                'url':          f.get('url'),
-                'ext':          ext,
-                'mimeType':     mime or f.get('format'),
-                'qualityLabel': f.get('quality_label') or f.get('resolution'),
-                'height':       safe_int(f.get('height')),
-                'width':        safe_int(f.get('width')),
-                'fps':          safe_int(f.get('fps')),
-                'abr':          safe_int(f.get('tbr') or f.get('abr')),
-                'vbr':          safe_int(f.get('tbr')),
-                'filesize':     safe_int(f.get('filesize') or f.get('filesize_approx')),
-                'vcodec':       f.get('vcodec', 'unknown'),
-                'acodec':       f.get('acodec', 'none'),
-                'has_video':    has_video,
-                'has_audio':    has_audio,
+                'url':      f['url'],
+                'ext':      f.get('ext', 'unknown'),
+                'abr':      safe_int(f.get('tbr') or f.get('abr')),
+                'height':   safe_int(f.get('height')),
+                'fps':      safe_int(f.get('fps')),
+                'has_video': has_video,
+                'has_audio': has_audio,
             })
 
-        muxed  = sorted([f for f in formats if f['has_video'] and f['has_audio']],
-                        key=lambda e: (e.get('height') or 0, e.get('fps') or 0), reverse=True)
-        videos = sorted([f for f in formats if f['has_video'] and not f['has_audio']],
-                        key=lambda e: (e.get('height') or 0, e.get('fps') or 0), reverse=True)
-        audios = sorted([f for f in formats if f['has_audio'] and not f['has_video']],
-                        key=lambda e: (e.get('abr') or 0), reverse=True)
+        result = {
+            'video_id':  video_id,
+            'title':     title,
+            'url':       f"https://www.youtube.com/watch?v={video_id}",
+            'duration':  entry.get('duration'),
+            'channel':   entry.get('uploader') or entry.get('channel'),
+            'thumbnail': entry.get('thumbnail'),
+            'download_mp3': f"/download-url?url=https://www.youtube.com/watch?v={video_id}",
+        }
 
-        def build_entry(f):
-            return {k: f[k] for k in
-                    ('itag','ext','mimeType','qualityLabel','height','width',
-                     'fps','vcodec','acodec','abr','vbr','filesize','url')}
+        if mode in ('audio', 'both'):
+            audios = [f for f in formats if f['has_audio'] and not f['has_video']]
+            best   = max(audios, key=lambda f: f.get('abr') or 0) if audios else None
+            result['audio_stream'] = {
+                'stream_url': best['url'] if best else None,
+                'ext':        best['ext'] if best else None,
+                'abr':        best['abr'] if best else None,
+            }
 
-        return jsonify({
-            'status':        'ok',
-            'video_id':      vid_id or video_id,
-            'title':         title,
-            'requested_url': youtube_url,
-            'muxed_formats': [build_entry(f) for f in muxed],
-            'video_formats': [build_entry(f) for f in videos],
-            'audio_formats': [build_entry(f) for f in audios],
-            'total_formats': len(formats),
-        }), 200
+        if mode in ('video', 'both'):
+            videos = [f for f in formats if f['has_video'] and not f['has_audio']]
+            best   = max(videos, key=lambda f: (f.get('height') or 0)) if videos else None
+            result['video_stream'] = {
+                'stream_url': best['url']    if best else None,
+                'ext':        best['ext']    if best else None,
+                'height':     best['height'] if best else None,
+            }
+
+        return jsonify({'status': 'ok', 'query': query, 'mode': mode, 'result': result}), 200
 
     except Exception as e:
         msg = str(e)
         if any(k in msg for k in ("Sign in", "bot", "LOGIN_REQUIRED")):
             return jsonify({'error': 'LOGIN_REQUIRED', 'detail': msg}), 403
         return jsonify({'error': msg}), 500
+
+
+# ── Route: GET / ──────────────────────────────────────────────────────────────
+@app.route('/', methods=['GET', 'HEAD'])
+@app.route('/online', methods=['GET'])
+def index():
+    return jsonify({
+        "status":  "ok",
+        "service": "yt-mp3-api",
+        "version": "4.0",
+        "endpoints": {
+            "GET /download?q=<song name>":          "🎵 Search by name → download MP3 instantly",
+            "GET /download-url?url=<yt_url>":       "🎵 YouTube URL → download MP3 instantly",
+            "GET /search?q=<song name>":            "🔍 Search by name → get stream URL (no download)",
+            "GET /search?q=<name>&mode=both":       "🔍 Search → get audio + video stream URLs",
+        },
+        "note": "ffmpeg must be installed on the server for MP3 conversion",
+    }), 200
 
 
 # ── Route: GET /webhook ────────────────────────────────────────────────────────
